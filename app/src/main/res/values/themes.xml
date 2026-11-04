@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.RadioWizard" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@color/night</item>
+        <item name="android:statusBarColor">@color/night</item>
+        <item name="android:navigationBarColor">@color/night</item>
+        <item name="colorAccent">@color/arcane</item>
+    </style>
+    <color name="night">#0E0B1A</color>
+    <color name="arcane">#9B6BFF</color>
+</resources>
