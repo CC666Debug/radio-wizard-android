@@ -460,6 +460,34 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        /** The song playing on a station: asks the stream for its titles ("ICY" metadata) and reads the first one. */
+        @JavascriptInterface fun icy(id: Int, args: String) {
+            val a = json(args)
+            net.execute {
+                val r = JSONObject()
+                try {
+                    a.put("headers", JSONObject().put("Icy-MetaData", "1")).put("timeout", a.optInt("timeout", 9000))
+                    val (c, _) = open(a.optString("url"), a, true)
+                    val every = c.getHeaderField("icy-metaint")?.trim()?.toIntOrNull()
+                    if (every == null || every <= 0 || every > 300_000) r.put("ok", false).put("why", "no titles")
+                    else c.inputStream.use { ins ->
+                        var skip = every.toLong()
+                        while (skip > 0) { val n = ins.skip(skip); if (n <= 0) { if (ins.read() < 0) break; skip-- } else skip -= n }
+                        val len = ins.read() * 16
+                        val buf = ByteArray(maxOf(len, 0))
+                        var got = 0
+                        while (got < len) { val n = ins.read(buf, got, len - got); if (n < 0) break; got += n }
+                        var text = String(buf, 0, got, Charsets.UTF_8)
+                        if ('\uFFFD' in text) text = String(buf, 0, got, Charsets.ISO_8859_1)
+                        val title = Regex("StreamTitle='(.*?)';").find(text)?.groupValues?.get(1)?.trim() ?: ""
+                        r.put("ok", title.isNotEmpty()).put("title", title)
+                    }
+                    c.disconnect()
+                } catch (e: Exception) { r.put("ok", false).put("error", e.javaClass.simpleName) }
+                answer(id, r)
+            }
+        }
+
         /** Tests a stream: does it answer and start sending something? Only the first few KB are read. */
         @JavascriptInterface fun probe(id: Int, args: String) {
             val a = json(args)
