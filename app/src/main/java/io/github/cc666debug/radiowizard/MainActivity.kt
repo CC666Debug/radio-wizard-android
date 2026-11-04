@@ -17,6 +17,8 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.KeyEvent
+import android.app.Dialog
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -342,6 +344,40 @@ class MainActivity : AppCompatActivity() {
 
     // ── Commands from the page ──────────────────────
 
+    // ── Bandcamp sign-in ────────────────────────────
+
+    private fun bandcampSignedIn() =
+        Regex("(^|;\\s*)identity=").containsMatchIn(CookieManager.getInstance().getCookie("https://bandcamp.com") ?: "")
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun showBandcampLogin() {
+        val dialog = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
+        val w = WebView(this)
+        w.settings.javaScriptEnabled = true
+        w.settings.domStorageEnabled = true
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
+        var done = false
+        w.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) {
+                // Signed in once Bandcamp has set its "identity" cookie and moved on from the login page.
+                if (!done && bandcampSignedIn() && !url.contains("/login")) {
+                    done = true
+                    CookieManager.getInstance().flush()
+                    dialog.dismiss()
+                }
+            }
+        }
+        dialog.setContentView(w)
+        dialog.setOnDismissListener {
+            w.destroy()
+            val ok = done || bandcampSignedIn()
+            web.evaluateJavascript("window.onBandcampLogin && window.onBandcampLogin($ok)", null)
+        }
+        w.loadUrl("https://bandcamp.com/login")
+        dialog.show()
+    }
+
     // ── Web requests for the page ───────────────────
     // The radio directories (TuneIn, SHOUTcast, Radio Garden...) block requests from websites, but not from apps,
     // so the page asks the phone to fetch them. Answers go back through window.AndroidHttp(id, result).
@@ -368,6 +404,10 @@ class MainActivity : AppCompatActivity() {
             c.setRequestProperty("User-Agent", browserAgent)
             c.setRequestProperty("Icy-MetaData", "0")
             a.optJSONObject("headers")?.let { h -> h.keys().forEach { k -> c.setRequestProperty(k, h.optString(k)) } }
+            // Signed in to Bandcamp: its pages and collection answer as you (so bought songs play in full).
+            val host = c.url.host
+            if (host == "bandcamp.com" || host.endsWith(".bandcamp.com"))
+                CookieManager.getInstance().getCookie("https://bandcamp.com")?.let { c.setRequestProperty("Cookie", it) }
             if (body != null) {
                 c.doOutput = true
                 c.setRequestProperty("Content-Type", a.optString("type", "application/x-www-form-urlencoded"))
@@ -495,6 +535,19 @@ class MainActivity : AppCompatActivity() {
             else askForFolder(name, text)
         }
 
+        /** "Sign in to Bandcamp": Bandcamp's own login page in a full-screen window; closes once you're signed in. */
+        @JavascriptInterface fun bandcampLogin() = main.post { showBandcampLogin() }
+
+        /** "Sign out / forget": drops Bandcamp's sign-in from this phone. */
+        @JavascriptInterface fun bandcampLogout() = main.post {
+            val cm = CookieManager.getInstance()
+            (cm.getCookie("https://bandcamp.com") ?: "").split(";").map { it.substringBefore("=").trim() }.filter { it.isNotEmpty() }.forEach { n ->
+                cm.setCookie("https://bandcamp.com", "$n=; Max-Age=0; Path=/")
+                cm.setCookie("https://bandcamp.com", "$n=; Max-Age=0; Path=/; Domain=.bandcamp.com")
+            }
+            cm.flush()
+        }
+
         /** The page is loaded: tell it where things stand, and rejoin a speaker that's still going. */
         @JavascriptInterface fun ready() = main.post {
             sendCastState()
@@ -541,11 +594,12 @@ class MainActivity : AppCompatActivity() {
                 a.optString("image").takeIf { it.isNotEmpty() }?.let { addImage(WebImage(Uri.parse(it))) }
             }
             val info = MediaInfo.Builder(a.optString("url"))
-                .setStreamType(MediaInfo.STREAM_TYPE_LIVE)
+                .setStreamType(if (a.optString("streamType") == "BUFFERED") MediaInfo.STREAM_TYPE_BUFFERED else MediaInfo.STREAM_TYPE_LIVE)
                 .setContentType(a.optString("contentType", "audio/mpeg"))
                 .setMetadata(metadata)
                 .build()
-            client.load(MediaLoadRequestData.Builder().setMediaInfo(info).setAutoplay(true).build())
+            client.load(MediaLoadRequestData.Builder().setMediaInfo(info).setAutoplay(true)
+                .setCurrentTime((a.optDouble("currentTime", 0.0) * 1000).toLong()).build())
                 .setResultCallback { r -> sendResult(id, r.status.isSuccess, r.status.statusMessage ?: "load_failed") }
         }
 
