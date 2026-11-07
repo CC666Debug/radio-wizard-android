@@ -378,6 +378,44 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
+    // ── SoundCloud sign-in ──────────────────────────
+
+    /** SoundCloud keeps your sign-in in its "oauth_token" cookie; it goes along on SoundCloud API requests. */
+    private fun soundcloudToken(): String? =
+        (CookieManager.getInstance().getCookie("https://soundcloud.com") ?: "").split(";").map { it.trim() }
+            .firstOrNull { it.startsWith("oauth_token=") }?.removePrefix("oauth_token=")?.takeIf { it.isNotEmpty() }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun showSoundcloudLogin() {
+        val dialog = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
+        val w = WebView(this)
+        w.settings.javaScriptEnabled = true
+        w.settings.domStorageEnabled = true
+        w.settings.javaScriptCanOpenWindowsAutomatically = true
+        // Looks like ordinary Chrome, so "Continue with Google" isn't refused inside the app.
+        w.settings.userAgentString = w.settings.userAgentString.replace("; wv", "").replace(Regex("Version/[\\d.]+ "), "")
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
+        var done = false
+        w.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) {
+                if (!done && soundcloudToken() != null) {
+                    done = true
+                    CookieManager.getInstance().flush()
+                    dialog.dismiss()
+                }
+            }
+        }
+        dialog.setContentView(w)
+        dialog.setOnDismissListener {
+            w.destroy()
+            val ok = done || soundcloudToken() != null
+            web.evaluateJavascript("window.onSoundcloudLogin && window.onSoundcloudLogin($ok)", null)
+        }
+        w.loadUrl("https://soundcloud.com/signin")
+        dialog.show()
+    }
+
     // ── Web requests for the page ───────────────────
     // The radio directories (TuneIn, SHOUTcast, Radio Garden...) block requests from websites, but not from apps,
     // so the page asks the phone to fetch them. Answers go back through window.AndroidHttp(id, result).
@@ -408,6 +446,8 @@ class MainActivity : AppCompatActivity() {
             val host = c.url.host
             if (host == "bandcamp.com" || host.endsWith(".bandcamp.com"))
                 CookieManager.getInstance().getCookie("https://bandcamp.com")?.let { c.setRequestProperty("Cookie", it) }
+            // Signed in to SoundCloud: its API answers as you (private likes and playlists, full Go+ songs).
+            if (host == "api-v2.soundcloud.com") soundcloudToken()?.let { c.setRequestProperty("Authorization", "OAuth $it") }
             if (body != null) {
                 c.doOutput = true
                 c.setRequestProperty("Content-Type", a.optString("type", "application/x-www-form-urlencoded"))
@@ -572,6 +612,19 @@ class MainActivity : AppCompatActivity() {
             (cm.getCookie("https://bandcamp.com") ?: "").split(";").map { it.substringBefore("=").trim() }.filter { it.isNotEmpty() }.forEach { n ->
                 cm.setCookie("https://bandcamp.com", "$n=; Max-Age=0; Path=/")
                 cm.setCookie("https://bandcamp.com", "$n=; Max-Age=0; Path=/; Domain=.bandcamp.com")
+            }
+            cm.flush()
+        }
+
+        /** "Sign in to SoundCloud": SoundCloud's own sign-in page in a full-screen window; closes once you're signed in. */
+        @JavascriptInterface fun soundcloudLogin() = main.post { showSoundcloudLogin() }
+
+        /** "Forget my SoundCloud": drops SoundCloud's sign-in from this phone. */
+        @JavascriptInterface fun soundcloudLogout() = main.post {
+            val cm = CookieManager.getInstance()
+            (cm.getCookie("https://soundcloud.com") ?: "").split(";").map { it.substringBefore("=").trim() }.filter { it.isNotEmpty() }.forEach { n ->
+                cm.setCookie("https://soundcloud.com", "$n=; Max-Age=0; Path=/")
+                cm.setCookie("https://soundcloud.com", "$n=; Max-Age=0; Path=/; Domain=.soundcloud.com")
             }
             cm.flush()
         }
