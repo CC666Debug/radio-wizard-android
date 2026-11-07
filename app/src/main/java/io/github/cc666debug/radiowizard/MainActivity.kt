@@ -159,7 +159,11 @@ class MainActivity : AppCompatActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (web.canGoBack()) web.goBack() else finish()
+                // Back works like the page's ‹ Back (closes an open box, leaves an album/list/playlist). With nothing
+                // to go back to, RW goes to the background instead of closing, so casting and your place are kept.
+                web.evaluateJavascript("(window.rwBack && window.rwBack()) ? 'y' : 'n'") { r ->
+                    if (r?.contains("y") != true) moveTaskToBack(true)
+                }
             }
         })
 
