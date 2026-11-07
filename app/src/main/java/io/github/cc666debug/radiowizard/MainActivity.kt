@@ -407,8 +407,14 @@ class MainActivity : AppCompatActivity() {
         settings.domStorageEnabled = true
         settings.javaScriptCanOpenWindowsAutomatically = true
         settings.setSupportMultipleWindows(true)
-        // Looks like ordinary Chrome, so "Continue with Google" isn't refused inside the app.
-        settings.userAgentString = settings.userAgentString.replace("; wv", "").replace(Regex("Version/[\\d.]+ "), "")
+        // Looks like desktop Chrome: a phone gets sent to SoundCloud's mobile site, whose after-sign-in page
+        // just spins forever inside an app (seen on the S26). Desktop Chrome also keeps "Continue with Google" working.
+        val chromeVer = Regex("Chrome/([\\d.]+)").find(settings.userAgentString)?.groupValues?.get(1) ?: "140.0.0.0"
+        settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$chromeVer Safari/537.36"
+        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = true
+        settings.builtInZoomControls = true
+        settings.displayZoomControls = false
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
     }
