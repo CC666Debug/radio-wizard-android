@@ -380,10 +380,26 @@ class MainActivity : AppCompatActivity() {
 
     // ── SoundCloud sign-in ──────────────────────────
 
-    /** SoundCloud keeps your sign-in in its "oauth_token" cookie; it goes along on SoundCloud API requests. */
+    /**
+     * Your SoundCloud sign-in: caught from SoundCloud's own requests while its page is open (it sends
+     * "Authorization: OAuth <token>"), or its "oauth_token" cookie. It goes along on SoundCloud API requests.
+     */
     private fun soundcloudToken(): String? =
-        (CookieManager.getInstance().getCookie("https://soundcloud.com") ?: "").split(";").map { it.trim() }
-            .firstOrNull { it.startsWith("oauth_token=") }?.removePrefix("oauth_token=")?.takeIf { it.isNotEmpty() }
+        prefs.getString("sc_token", null)?.takeIf { it.isNotEmpty() }
+            ?: (CookieManager.getInstance().getCookie("https://soundcloud.com") ?: "").split(";").map { it.trim() }
+                .firstOrNull { it.startsWith("oauth_token=") }?.removePrefix("oauth_token=")?.takeIf { it.isNotEmpty() }
+
+    /** Watches the sign-in page's own requests to SoundCloud for your sign-in. */
+    private fun catchSoundcloudToken(request: WebResourceRequest, found: () -> Unit) {
+        val host = request.url.host ?: return
+        if (!host.endsWith("soundcloud.com")) return
+        val auth = request.requestHeaders.entries.firstOrNull { it.key.equals("Authorization", true) }?.value ?: return
+        if (!auth.startsWith("OAuth ")) return
+        val t = auth.removePrefix("OAuth ").trim()
+        if (t.isEmpty() || t == prefs.getString("sc_token", null)) { if (t.isNotEmpty()) main.post(found); return }
+        prefs.edit().putString("sc_token", t).apply()
+        main.post(found)
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun loginView(): WebView = WebView(this).apply {
@@ -407,7 +423,7 @@ class MainActivity : AppCompatActivity() {
         val w = loginView()
         var done = false
         val popups = mutableListOf<Pair<Dialog, WebView>>()
-        fun finish() {
+        fun scDone() {
             if (done) return
             done = true
             CookieManager.getInstance().flush()
@@ -417,13 +433,17 @@ class MainActivity : AppCompatActivity() {
         val check = object : Runnable {
             override fun run() {
                 if (done) return
-                if (soundcloudToken() != null) finish() else main.postDelayed(this, 1000)
+                if (soundcloudToken() != null) scDone() else main.postDelayed(this, 1000)
             }
         }
         val chrome = object : WebChromeClient() {
             override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message): Boolean {
                 val pw = loginView()
-                pw.webViewClient = WebViewClient()
+                pw.webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): android.webkit.WebResourceResponse? {
+                        catchSoundcloudToken(request) { scDone() }; return null
+                    }
+                }
                 pw.webChromeClient = this
                 val pd = Dialog(this@MainActivity, android.R.style.Theme_DeviceDefault_NoActionBar)
                 pd.setContentView(pw)
@@ -440,9 +460,33 @@ class MainActivity : AppCompatActivity() {
         }
         w.webChromeClient = chrome
         w.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView, url: String) { if (soundcloudToken() != null) finish() }
+            override fun onPageFinished(view: WebView, url: String) { if (soundcloudToken() != null) scDone() }
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): android.webkit.WebResourceResponse? {
+                catchSoundcloudToken(request) { scDone() }; return null
+            }
         }
-        dialog.setContentView(w)
+        // A bar on top, so it's clear this is SoundCloud's sign-in and not RadioWizard itself.
+        val bar = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            setBackgroundColor(0xFF1B1622.toInt())
+            setPadding(32, 24, 16, 24)
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            addView(android.widget.TextView(this@MainActivity).apply {
+                text = "Sign in to SoundCloud · closes by itself"
+                setTextColor(0xFFFFFFFF.toInt()); textSize = 16f
+            }, android.widget.LinearLayout.LayoutParams(0, -2, 1f))
+            addView(android.widget.TextView(this@MainActivity).apply {
+                text = "✕"; setTextColor(0xFFFFFFFF.toInt()); textSize = 22f; setPadding(32, 0, 32, 0)
+                setOnClickListener { dialog.dismiss() }
+            })
+        }
+        val box = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            fitsSystemWindows = true
+            addView(bar, -1, -2)
+            addView(w, android.widget.LinearLayout.LayoutParams(-1, 0, 1f))
+        }
+        dialog.setContentView(box)
         dialog.setOnDismissListener {
             main.removeCallbacks(check)
             popups.toList().forEach { (d, _) -> d.dismiss() }
@@ -660,6 +704,7 @@ class MainActivity : AppCompatActivity() {
 
         /** "Forget my SoundCloud": drops SoundCloud's sign-in from this phone. */
         @JavascriptInterface fun soundcloudLogout() = main.post {
+            prefs.edit().remove("sc_token").apply()
             val cm = CookieManager.getInstance()
             (cm.getCookie("https://soundcloud.com") ?: "").split(";").map { it.substringBefore("=").trim() }.filter { it.isNotEmpty() }.forEach { n ->
                 cm.setCookie("https://soundcloud.com", "$n=; Max-Age=0; Path=/")
