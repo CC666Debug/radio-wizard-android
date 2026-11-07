@@ -391,8 +391,8 @@ class MainActivity : AppCompatActivity() {
 
     /** Watches the sign-in page's own requests to SoundCloud for your sign-in. */
     private fun catchSoundcloudToken(request: WebResourceRequest, found: () -> Unit) {
-        val host = request.url.host ?: return
-        if (!host.endsWith("soundcloud.com")) return
+        // Only the API's own requests carry the real sign-in (others can carry short-lived sign-in-step tokens).
+        if (request.url.host != "api-v2.soundcloud.com") return
         val auth = request.requestHeaders.entries.firstOrNull { it.key.equals("Authorization", true) }?.value ?: return
         if (!auth.startsWith("OAuth ")) return
         val t = auth.removePrefix("OAuth ").trim()
@@ -422,6 +422,10 @@ class MainActivity : AppCompatActivity() {
         val dialog = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
         val w = loginView()
         var done = false
+        // Set the old sign-in aside, so only a fresh one from SoundCloud's page closes the window
+        // (a refused one used to close it straight away and nothing changed). ✕ puts it back.
+        val old = prefs.getString("sc_token", null)
+        prefs.edit().remove("sc_token").apply()
         val popups = mutableListOf<Pair<Dialog, WebView>>()
         fun scDone() {
             if (done) return
@@ -446,7 +450,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 pw.webChromeClient = this
                 val pd = Dialog(this@MainActivity, android.R.style.Theme_DeviceDefault_NoActionBar)
-                pd.setContentView(pw)
+                pd.setContentView(signinBox(pw) { pd.dismiss() })
                 pd.setOnDismissListener { popups.removeAll { it.second === pw }; pw.destroy() }
                 popups.add(pd to pw)
                 pd.show()
@@ -465,7 +469,22 @@ class MainActivity : AppCompatActivity() {
                 catchSoundcloudToken(request) { scDone() }; return null
             }
         }
-        // A bar on top, so it's clear this is SoundCloud's sign-in and not RadioWizard itself.
+        dialog.setContentView(signinBox(w) { dialog.dismiss() })
+        dialog.setOnDismissListener {
+            main.removeCallbacks(check)
+            popups.toList().forEach { (d, _) -> d.dismiss() }
+            w.destroy()
+            if (!done && old != null && prefs.getString("sc_token", null) == null) prefs.edit().putString("sc_token", old).apply()
+            val ok = done
+            web.evaluateJavascript("window.onSoundcloudLogin && window.onSoundcloudLogin($ok)", null)
+        }
+        w.loadUrl("https://soundcloud.com/signin")
+        dialog.show()
+        main.postDelayed(check, 1000)
+    }
+
+    /** SoundCloud's page under a bar (↻ reload, ✕ close), so it's clear it's SoundCloud's sign-in and never a trap. */
+    private fun signinBox(w: WebView, close: () -> Unit): android.view.View {
         val bar = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.HORIZONTAL
             setBackgroundColor(0xFF1B1622.toInt())
@@ -476,27 +495,20 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(0xFFFFFFFF.toInt()); textSize = 16f
             }, android.widget.LinearLayout.LayoutParams(0, -2, 1f))
             addView(android.widget.TextView(this@MainActivity).apply {
+                text = "↻"; setTextColor(0xFFFFFFFF.toInt()); textSize = 22f; setPadding(32, 0, 32, 0)
+                setOnClickListener { w.reload() }
+            })
+            addView(android.widget.TextView(this@MainActivity).apply {
                 text = "✕"; setTextColor(0xFFFFFFFF.toInt()); textSize = 22f; setPadding(32, 0, 32, 0)
-                setOnClickListener { dialog.dismiss() }
+                setOnClickListener { close() }
             })
         }
-        val box = android.widget.LinearLayout(this).apply {
+        return android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
             fitsSystemWindows = true
             addView(bar, -1, -2)
             addView(w, android.widget.LinearLayout.LayoutParams(-1, 0, 1f))
         }
-        dialog.setContentView(box)
-        dialog.setOnDismissListener {
-            main.removeCallbacks(check)
-            popups.toList().forEach { (d, _) -> d.dismiss() }
-            w.destroy()
-            val ok = done || soundcloudToken() != null
-            web.evaluateJavascript("window.onSoundcloudLogin && window.onSoundcloudLogin($ok)", null)
-        }
-        w.loadUrl("https://soundcloud.com/signin")
-        dialog.show()
-        main.postDelayed(check, 1000)
     }
 
     // ── Web requests for the page ───────────────────
@@ -524,13 +536,15 @@ class MainActivity : AppCompatActivity() {
             c.requestMethod = method
             c.setRequestProperty("User-Agent", browserAgent)
             c.setRequestProperty("Icy-MetaData", "0")
-            a.optJSONObject("headers")?.let { h -> h.keys().forEach { k -> c.setRequestProperty(k, h.optString(k)) } }
+            // X-RW-NoAuth: the page asks as nobody (it retries this way when SoundCloud turns the sign-in down).
+            val noAuth = a.optJSONObject("headers")?.has("X-RW-NoAuth") == true
+            a.optJSONObject("headers")?.let { h -> h.keys().forEach { k -> if (k != "X-RW-NoAuth") c.setRequestProperty(k, h.optString(k)) } }
             // Signed in to Bandcamp: its pages and collection answer as you (so bought songs play in full).
             val host = c.url.host
             if (host == "bandcamp.com" || host.endsWith(".bandcamp.com"))
                 CookieManager.getInstance().getCookie("https://bandcamp.com")?.let { c.setRequestProperty("Cookie", it) }
             // Signed in to SoundCloud: its API answers as you (private likes and playlists, full Go+ songs).
-            if (host == "api-v2.soundcloud.com") soundcloudToken()?.let { c.setRequestProperty("Authorization", "OAuth $it") }
+            if (host == "api-v2.soundcloud.com" && !noAuth) soundcloudToken()?.let { c.setRequestProperty("Authorization", "OAuth $it") }
             if (body != null) {
                 c.doOutput = true
                 c.setRequestProperty("Content-Type", a.optString("type", "application/x-www-form-urlencoded"))
@@ -706,9 +720,16 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface fun soundcloudLogout() = main.post {
             prefs.edit().remove("sc_token").apply()
             val cm = CookieManager.getInstance()
-            (cm.getCookie("https://soundcloud.com") ?: "").split(";").map { it.substringBefore("=").trim() }.filter { it.isNotEmpty() }.forEach { n ->
-                cm.setCookie("https://soundcloud.com", "$n=; Max-Age=0; Path=/")
-                cm.setCookie("https://soundcloud.com", "$n=; Max-Age=0; Path=/; Domain=.soundcloud.com")
+            // Every SoundCloud address and what its pages stored, so the next sign-in starts clean
+            // (left-overs on secure./api-auth. made SoundCloud's sign-in page spin forever).
+            val hosts = listOf("soundcloud.com", "www.soundcloud.com", "m.soundcloud.com", "secure.soundcloud.com", "api-auth.soundcloud.com", "api-v2.soundcloud.com", "api.soundcloud.com")
+            hosts.forEach { h ->
+                (cm.getCookie("https://$h") ?: "").split(";").map { it.substringBefore("=").trim() }.filter { it.isNotEmpty() }.forEach { n ->
+                    cm.setCookie("https://$h", "$n=; Max-Age=0; Path=/")
+                    cm.setCookie("https://$h", "$n=; Max-Age=0; Path=/; Domain=$h")
+                    cm.setCookie("https://$h", "$n=; Max-Age=0; Path=/; Domain=.soundcloud.com")
+                }
+                android.webkit.WebStorage.getInstance().deleteOrigin("https://$h")
             }
             cm.flush()
         }
