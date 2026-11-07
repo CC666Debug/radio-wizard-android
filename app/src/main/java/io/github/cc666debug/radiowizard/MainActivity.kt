@@ -386,34 +386,73 @@ class MainActivity : AppCompatActivity() {
             .firstOrNull { it.startsWith("oauth_token=") }?.removePrefix("oauth_token=")?.takeIf { it.isNotEmpty() }
 
     @SuppressLint("SetJavaScriptEnabled")
+    private fun loginView(): WebView = WebView(this).apply {
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        settings.javaScriptCanOpenWindowsAutomatically = true
+        settings.setSupportMultipleWindows(true)
+        // Looks like ordinary Chrome, so "Continue with Google" isn't refused inside the app.
+        settings.userAgentString = settings.userAgentString.replace("; wv", "").replace(Regex("Version/[\\d.]+ "), "")
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+    }
+
+    /**
+     * SoundCloud's sign-in opens its own pop-up window and reports back to the page that opened it,
+     * so pop-ups get a real window of their own here (without one, the sign-in never finishes).
+     * Closes by itself once SoundCloud has set its "oauth_token" cookie (checked every second).
+     */
     private fun showSoundcloudLogin() {
         val dialog = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
-        val w = WebView(this)
-        w.settings.javaScriptEnabled = true
-        w.settings.domStorageEnabled = true
-        w.settings.javaScriptCanOpenWindowsAutomatically = true
-        // Looks like ordinary Chrome, so "Continue with Google" isn't refused inside the app.
-        w.settings.userAgentString = w.settings.userAgentString.replace("; wv", "").replace(Regex("Version/[\\d.]+ "), "")
-        CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(w, true)
+        val w = loginView()
         var done = false
-        w.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView, url: String) {
-                if (!done && soundcloudToken() != null) {
-                    done = true
-                    CookieManager.getInstance().flush()
-                    dialog.dismiss()
-                }
+        val popups = mutableListOf<Pair<Dialog, WebView>>()
+        fun finish() {
+            if (done) return
+            done = true
+            CookieManager.getInstance().flush()
+            popups.toList().forEach { (d, _) -> d.dismiss() }
+            dialog.dismiss()
+        }
+        val check = object : Runnable {
+            override fun run() {
+                if (done) return
+                if (soundcloudToken() != null) finish() else main.postDelayed(this, 1000)
             }
+        }
+        val chrome = object : WebChromeClient() {
+            override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message): Boolean {
+                val pw = loginView()
+                pw.webViewClient = WebViewClient()
+                pw.webChromeClient = this
+                val pd = Dialog(this@MainActivity, android.R.style.Theme_DeviceDefault_NoActionBar)
+                pd.setContentView(pw)
+                pd.setOnDismissListener { popups.removeAll { it.second === pw }; pw.destroy() }
+                popups.add(pd to pw)
+                pd.show()
+                (resultMsg.obj as WebView.WebViewTransport).webView = pw
+                resultMsg.sendToTarget()
+                return true
+            }
+            override fun onCloseWindow(window: WebView) {
+                popups.firstOrNull { it.second === window }?.first?.dismiss()
+            }
+        }
+        w.webChromeClient = chrome
+        w.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) { if (soundcloudToken() != null) finish() }
         }
         dialog.setContentView(w)
         dialog.setOnDismissListener {
+            main.removeCallbacks(check)
+            popups.toList().forEach { (d, _) -> d.dismiss() }
             w.destroy()
             val ok = done || soundcloudToken() != null
             web.evaluateJavascript("window.onSoundcloudLogin && window.onSoundcloudLogin($ok)", null)
         }
         w.loadUrl("https://soundcloud.com/signin")
         dialog.show()
+        main.postDelayed(check, 1000)
     }
 
     // ── Web requests for the page ───────────────────
