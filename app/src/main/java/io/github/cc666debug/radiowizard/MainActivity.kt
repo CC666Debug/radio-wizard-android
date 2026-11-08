@@ -35,6 +35,8 @@ import com.google.android.gms.cast.Cast
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaMetadata
+import com.google.android.gms.cast.MediaQueueData
+import com.google.android.gms.cast.MediaQueueItem
 import com.google.android.gms.cast.MediaStatus
 import com.google.android.gms.cast.framework.CastContext
 import com.google.android.gms.cast.framework.CastSession
@@ -785,22 +787,39 @@ class MainActivity : AppCompatActivity() {
             }.show()
         }
 
-        @JavascriptInterface fun load(id: Int, args: String) = main.post {
-            val a = json(args)
-            val client = session?.remoteMediaClient ?: run { sendResult(id, false, "no_session"); return@post }
+        private fun mediaInfo(a: JSONObject): MediaInfo {
             val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MUSIC_TRACK).apply {
                 putString(MediaMetadata.KEY_TITLE, a.optString("title"))
                 a.optString("subtitle").takeIf { it.isNotEmpty() }?.let { putString(MediaMetadata.KEY_ARTIST, it) }
                 a.optString("image").takeIf { it.isNotEmpty() }?.let { addImage(WebImage(Uri.parse(it))) }
             }
-            val info = MediaInfo.Builder(a.optString("url"))
+            return MediaInfo.Builder(a.optString("url"))
                 .setStreamType(if (a.optString("streamType") == "BUFFERED") MediaInfo.STREAM_TYPE_BUFFERED else MediaInfo.STREAM_TYPE_LIVE)
                 .setContentType(a.optString("contentType", "audio/mpeg"))
                 .setMetadata(metadata)
                 .build()
-            client.load(MediaLoadRequestData.Builder().setMediaInfo(info).setAutoplay(true)
-                .setCurrentTime((a.optDouble("currentTime", 0.0) * 1000).toLong()).build())
-                .setResultCallback { r -> sendResult(id, r.status.isSuccess, r.status.statusMessage ?: "load_failed") }
+        }
+        // Songs go in a speaker queue: the speaker moves on to the next song by itself, so the phone can sleep.
+        private fun queueItem(a: JSONObject) = MediaQueueItem.Builder(mediaInfo(a)).setAutoplay(true).setPreloadTime(15.0).build()
+
+        @JavascriptInterface fun load(id: Int, args: String) = main.post {
+            val a = json(args)
+            val client = session?.remoteMediaClient ?: run { sendResult(id, false, "no_session"); return@post }
+            val req = MediaLoadRequestData.Builder().setAutoplay(true).setCurrentTime((a.optDouble("currentTime", 0.0) * 1000).toLong())
+            if (a.optBoolean("queue")) {
+                req.setQueueData(MediaQueueData.Builder().setItems(listOf(queueItem(a))).setStartIndex(0)
+                    .setRepeatMode(MediaStatus.REPEAT_MODE_REPEAT_OFF).build())
+            } else req.setMediaInfo(mediaInfo(a))
+            client.load(req.build()).setResultCallback { r -> sendResult(id, r.status.isSuccess, r.status.statusMessage ?: "load_failed") }
+        }
+
+        // More songs at the end of the speaker's queue.
+        @JavascriptInterface fun queueAdd(id: Int, args: String) = main.post {
+            val client = session?.remoteMediaClient ?: run { sendResult(id, false, "no_session"); return@post }
+            val list = json(args).optJSONArray("items") ?: run { sendResult(id, false, "no_items"); return@post }
+            val items = (0 until list.length()).map { queueItem(list.getJSONObject(it)) }.toTypedArray()
+            client.queueInsertItems(items, MediaQueueItem.INVALID_ITEM_ID, null)
+                .setResultCallback { r -> sendResult(id, r.status.isSuccess, r.status.statusMessage ?: "queue_failed") }
         }
 
         @JavascriptInterface fun pause(id: Int, args: String) = main.post {
