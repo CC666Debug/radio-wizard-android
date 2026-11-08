@@ -275,8 +275,8 @@ class MainActivity : AppCompatActivity() {
         s.remoteMediaClient?.registerCallback(mediaCallback)
         s.addCastListener(volumeListener)
         CastKeepAliveService.start(this, s.castDevice?.friendlyName)   // keeps the app (and the speaker) alive when swiped away
-        // Songs (unlike radio) need the page to send the next one when a song ends. With the screen off Android froze
-        // the page, so the speaker finished the song, sat idle and then dropped the group. Keep the page running.
+        // Songs (unlike radio) need the page to send the next one when a song ends; this stops Android from freezing
+        // the page while the app is in the background. It does NOT keep the phone awake (no wake lock: battery).
         if (Build.VERSION.SDK_INT >= 26) web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
     }
 
