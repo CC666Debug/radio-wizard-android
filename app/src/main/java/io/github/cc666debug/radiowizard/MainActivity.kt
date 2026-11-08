@@ -275,6 +275,9 @@ class MainActivity : AppCompatActivity() {
         s.remoteMediaClient?.registerCallback(mediaCallback)
         s.addCastListener(volumeListener)
         CastKeepAliveService.start(this, s.castDevice?.friendlyName)   // keeps the app (and the speaker) alive when swiped away
+        // Songs (unlike radio) need the page to send the next one when a song ends. With the screen off Android froze
+        // the page, so the speaker finished the song, sat idle and then dropped the group. Keep the page running.
+        if (Build.VERSION.SDK_INT >= 26) web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
     }
 
     /** Lets go of the speaker (or group) in Android's own speaker list too. Ending only the cast left the
@@ -305,6 +308,7 @@ class MainActivity : AppCompatActivity() {
         session?.removeCastListener(volumeListener)
         session = null
         CastKeepAliveService.stop(this)
+        if (Build.VERSION.SDK_INT >= 26) web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true)
     }
 
     private val sessionListener = object : SessionManagerListener<CastSession> {
