@@ -63,6 +63,7 @@ class MainActivity : AppCompatActivity() {
     private val main = Handler(Looper.getMainLooper())
 
     private var session: CastSession? = null
+    private lateinit var keys: MediaKeys
     private var pickId = 0   // the page's open "pick a speaker" request, if any
 
     private var fileCallback: ValueCallback<Array<Uri>>? = null
@@ -156,6 +157,12 @@ class MainActivity : AppCompatActivity() {
         }
         web.addJavascriptInterface(Bridge(), "AndroidCast")
 
+        // Headphone / Bluetooth / lock screen / notification buttons → RW's player buttons.
+        keys = MediaKeys(this) { k -> main.post { web.evaluateJavascript("window.rwMediaKey && window.rwMediaKey('$k')", null) } }
+        keys.speakerVolume = { session?.takeIf { it.isConnected }?.volume }
+        keys.setSpeakerVolume = { v -> main.post { try { session?.takeIf { it.isConnected }?.let { if (it.isMute && v > 0) it.isMute = false; it.volume = v } } catch (e: Exception) {} } }
+        CastKeepAliveService.keyHandler = { k -> main.post { web.evaluateJavascript("window.rwMediaKey && window.rwMediaKey('$k')", null) } }
+
         castContext.addCastStateListener { sendCastState() }
         castContext.sessionManager.addSessionManagerListener(sessionListener, CastSession::class.java)
 
@@ -202,6 +209,8 @@ class MainActivity : AppCompatActivity() {
         main.removeCallbacks(giveUpSuspended)
         castContext.sessionManager.removeSessionManagerListener(sessionListener, CastSession::class.java)
         net.shutdownNow()
+        CastKeepAliveService.keyHandler = null
+        keys.release()
         web.destroy()
         super.onDestroy()
     }
@@ -269,7 +278,7 @@ class MainActivity : AppCompatActivity() {
         override fun onStatusUpdated() = sendStatus()
     }
     private val volumeListener = object : Cast.Listener() {
-        override fun onVolumeChanged() = sendStatus()
+        override fun onVolumeChanged() { sendStatus(); keys.speakerVolumeChanged() }
     }
 
     private fun attach(s: CastSession) {
@@ -751,6 +760,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         /** The page is loaded: tell it where things stand, and rejoin a speaker that's still going. */
+        /** What's playing, for the headphone buttons / notification: {active, playing, speaker, title, artist, album, art}. */
+        @JavascriptInterface fun mediaState(json: String) = main.post {
+            try { keys.update(JSONObject(json)) } catch (e: Exception) {}
+        }
+
         @JavascriptInterface fun ready() = main.post {
             sendCastState()
             // Only rejoin a speaker that's fully connected; one still reconnecting reports in onSessionResumed.
