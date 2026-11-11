@@ -264,7 +264,8 @@ class MainActivity : AppCompatActivity() {
             JSONObject()
                 .put("playerState", playerState ?: JSONObject.NULL)
                 .put("idleReason", idleReason ?: JSONObject.NULL)
-                .put("contentId", it.mediaInfo?.contentId ?: JSONObject.NULL)
+                // the queue's current song (the plain media field can stay on an earlier song after the speaker moves on)
+                .put("contentId", (it.getQueueItemById(it.currentItemId)?.media ?: it.mediaInfo)?.contentId ?: JSONObject.NULL)
         }
         send(JSONObject().put("type", "status")
             .put("media", media ?: JSONObject.NULL)
