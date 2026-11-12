@@ -421,6 +421,26 @@ class MainActivity : AppCompatActivity() {
         main.post(found)
     }
 
+    /** Tracker / analytics hosts the sign-in window never loads (SoundCloud sign-in works without them). */
+    private val trackerHosts = listOf(
+        "segment.io", "segment.com", "segmentapis.com",
+        "google-analytics.com", "googletagmanager.com", "googleadservices.com", "doubleclick.net", "googlesyndication.com",
+        "facebook.net",
+        "scorecardresearch.com", "quantserve.com", "quantcount.com", "comscore.com",
+        "hotjar.com", "hotjar.io", "amplitude.com", "mixpanel.com", "branch.io", "app.link",
+        "adnxs.com", "criteo.com", "criteo.net", "taboola.com", "outbrain.com", "pubmatic.com", "rubiconproject.com",
+        "moatads.com", "chartbeat.com", "chartbeat.net", "newrelic.com", "nr-data.net",
+        "browser-intake-datadoghq.com", "browser-intake-datadoghq.eu", "bat.bing.com", "clarity.ms",
+        "analytics.tiktok.com", "tr.snapchat.com", "ads-twitter.com", "analytics.twitter.com", "ct.pinterest.com"
+    )
+
+    /** Empty answer for tracker requests, so nothing is ever sent to them. */
+    private fun blockTracker(request: WebResourceRequest): android.webkit.WebResourceResponse? {
+        val h = request.url.host?.lowercase() ?: return null
+        if (trackerHosts.none { h == it || h.endsWith(".$it") }) return null
+        return android.webkit.WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), java.io.ByteArrayInputStream(ByteArray(0)))
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun loginView(): WebView = WebView(this).apply {
         settings.javaScriptEnabled = true
@@ -471,6 +491,7 @@ class MainActivity : AppCompatActivity() {
                 val pw = loginView()
                 pw.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): android.webkit.WebResourceResponse? {
+                        blockTracker(request)?.let { return it }
                         catchSoundcloudToken(request) { scDone() }; return null
                     }
                 }
@@ -492,7 +513,8 @@ class MainActivity : AppCompatActivity() {
         w.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView, url: String) { if (soundcloudToken() != null) scDone() }
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): android.webkit.WebResourceResponse? {
-                catchSoundcloudToken(request) { scDone() }; return null
+                blockTracker(request)?.let { return it }
+                        catchSoundcloudToken(request) { scDone() }; return null
             }
         }
         dialog.setContentView(signinBox(w) { dialog.dismiss() })
