@@ -85,6 +85,22 @@ class MainActivity : AppCompatActivity() {
         if (text == null) sendBackup(true, b.first, "picked") else writeBackup(uri, b.first, text, false)
     }
 
+    /** "Save log": the phone's own Save as screen (pick folder + name); answers through onAndroidSaveAs. */
+    private var pendingSave: String? = null
+    private val saveDoc = registerForActivityResult(ActivityResultContracts.CreateDocument("text/markdown")) { uri ->
+        val text = pendingSave ?: return@registerForActivityResult
+        pendingSave = null
+        val r = JSONObject()
+        if (uri == null) r.put("ok", false).put("where", "cancel")
+        else try {
+            contentResolver.openOutputStream(uri, "wt")?.use { it.write(text.toByteArray()) } ?: throw Exception("couldn't open the file")
+            var where = ""
+            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { if (it.moveToFirst()) where = it.getString(0) }
+            r.put("ok", true).put("where", where)
+        } catch (e: Exception) { r.put("ok", false).put("where", "error") }
+        main.post { web.evaluateJavascript("window.onAndroidSaveAs && window.onAndroidSaveAs($r)", null) }
+    }
+
     private fun askForFolder(name: String, text: String?) {
         pendingBackup = name to text
         try { pickFolder.launch(null) } catch (e: Exception) { pendingBackup = null; sendBackup(false, name, "error") }
@@ -706,6 +722,12 @@ class MainActivity : AppCompatActivity() {
                 putExtra(Intent.EXTRA_TEXT, text)
             }
             startActivity(Intent.createChooser(send, title))
+        }
+
+        /** "Save log": lets the user pick where the file goes. */
+        @JavascriptInterface fun saveAs(name: String, text: String) = main.post {
+            pendingSave = text
+            try { saveDoc.launch(name) } catch (e: Exception) { pendingSave = null }
         }
 
         /** "Back up" in Saved songs: write the file to the phone's Downloads folder. */
