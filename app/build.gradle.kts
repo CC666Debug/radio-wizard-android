@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.cc666debug.radiowizard"
         minSdk = 24
         targetSdk = 35
-        versionCode = 16
-        versionName = "1.15"
+        versionCode = 17
+        versionName = "1.16"
     }
 
     compileOptions {
