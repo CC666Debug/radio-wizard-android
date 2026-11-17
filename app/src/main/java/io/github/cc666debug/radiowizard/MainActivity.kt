@@ -10,6 +10,13 @@ import android.content.ContentValues
 import android.os.Bundle
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
+import android.app.ActivityManager
+import android.app.usage.UsageStatsManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
+import android.os.PowerManager
 import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.MediaStore
@@ -184,6 +191,7 @@ class MainActivity : AppCompatActivity() {
 
         castContext.addCastStateListener { sendCastState() }
         castContext.sessionManager.addSessionManagerListener(sessionListener, CastSession::class.java)
+        startPhoneWatch()
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -237,6 +245,8 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         main.removeCallbacks(giveUpSuspended); main.removeCallbacks(volSettled)
         stopRejoin(keepAlive = true)
+        stopPhoneWatch()
+        main.removeCallbacks(tick)
         castContext.sessionManager.removeSessionManagerListener(sessionListener, CastSession::class.java)
         net.shutdownNow()
         CastKeepAliveService.keyHandler = null
@@ -313,7 +323,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun attach(s: CastSession) {
+        val fresh = session == null
         session = s
+        lastDev = s.castDevice ?: lastDev
+        if (fresh) {
+            if (lastNet.isNotEmpty()) log("phone: on $lastNet")
+            main.removeCallbacks(tick); tickEl = 0L; tick.run()
+        }
         s.remoteMediaClient?.registerCallback(mediaCallback)
         s.addCastListener(volumeListener)
         CastKeepAliveService.start(this, s.castDevice?.friendlyName)   // keeps the app (and the speaker) alive when swiped away
@@ -339,7 +355,7 @@ class MainActivity : AppCompatActivity() {
     private val giveUpSuspended = Runnable {
         val s = castContext.sessionManager.currentCastSession
         if (s == null || !s.isConnected) {
-            val dev = s?.castDevice
+            val dev = s?.castDevice ?: lastDev
             castContext.sessionManager.endCurrentSession(false)
             detach(keepAlive = dev != null && !ownStop())
             sendSession("SESSION_ENDED", null, "gave up after 15s")
@@ -351,6 +367,7 @@ class MainActivity : AppCompatActivity() {
         session?.remoteMediaClient?.unregisterCallback(mediaCallback)
         session?.removeCastListener(volumeListener)
         session = null
+        main.removeCallbacks(tick); tickEl = 0L
         if (!keepAlive) CastKeepAliveService.stop(this)
         if (Build.VERSION.SDK_INT >= 26) web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true)
     }
@@ -371,8 +388,108 @@ class MainActivity : AppCompatActivity() {
 
     private fun ownStop() = SystemClock.elapsedRealtime() - controllerAt < 120_000
 
-    private fun log(msg: String) = main.post {
-        web.evaluateJavascript("window.diag && diag(" + JSONObject.quote(msg) + ")", null)
+    // A line for the page's log. If the page was frozen and the line arrives late, it says when it really happened.
+    private fun log(msg: String) {
+        val t = System.currentTimeMillis()
+        main.post {
+            web.evaluateJavascript("(function(t,m){var d=Date.now()-t;window.diag&&diag(d>3000?m+' (phone time '+new Date(t).toTimeString().slice(0,8)+')':m)})($t," + JSONObject.quote(msg) + ")", null)
+        }
+    }
+
+    // ── Phone watch (1.18, log only) ────────────────
+    // So a saved log shows what the PHONE did around a drop: screen, deep sleep, charger, network, Android blocking the
+    // app's network, and how long the app itself was paused. Everything here only reacts to Android's own reports
+    // (nothing is kept awake, nothing polls the network); lines are written only while casting or rejoining.
+    private var lastDev: CastDevice? = null
+    private var lastNet = ""
+    private var startLogged = false
+    private fun watching() = session != null || rejoinId != null
+
+    private val netLog = object : ConnectivityManager.NetworkCallback() {
+        override fun onLost(network: Network) { main.post { lastNet = ""; if (watching()) log("phone: network lost") } }
+        override fun onCapabilitiesChanged(network: Network, nc: NetworkCapabilities) {
+            val kind = when {
+                nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+                nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "mobile data"
+                else -> "other network"
+            }
+            var band = ""
+            if (kind == "Wi-Fi" && Build.VERSION.SDK_INT >= 29) (nc.transportInfo as? android.net.wifi.WifiInfo)?.frequency?.let { f ->
+                band = if (f >= 5925) " 6 GHz" else if (f >= 4900) " 5 GHz" else if (f > 0) " 2.4 GHz" else ""
+            }
+            val s = kind + band + if (nc.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) "" else " (no internet)"
+            main.post { if (s != lastNet) { lastNet = s; if (watching()) log("phone: on $s") } }
+        }
+        override fun onBlockedStatusChanged(network: Network, blocked: Boolean) {
+            main.post { if (watching()) log(if (blocked) "phone: Android BLOCKED this app's network" else "phone: Android unblocked this app's network") }
+        }
+    }
+
+    private val phoneLog = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, i: Intent) {
+            if (i.action == Intent.ACTION_SCREEN_ON) rejoinScan()   // after a drop: look for the speaker again on wake
+            if (!watching()) return
+            val pm = getSystemService(PowerManager::class.java)
+            log(when (i.action) {
+                Intent.ACTION_SCREEN_ON -> "phone: screen on"
+                Intent.ACTION_SCREEN_OFF -> "phone: screen off"
+                Intent.ACTION_POWER_CONNECTED -> "phone: charger in"
+                Intent.ACTION_POWER_DISCONNECTED -> "phone: charger out"
+                PowerManager.ACTION_POWER_SAVE_MODE_CHANGED -> "phone: power saving " + if (pm.isPowerSaveMode) "on" else "off"
+                PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> "phone: deep sleep (Doze) " + if (pm.isDeviceIdleMode) "started" else "ended"
+                else -> if (Build.VERSION.SDK_INT >= 33 && i.action == PowerManager.ACTION_DEVICE_LIGHT_IDLE_MODE_CHANGED)
+                    "phone: light sleep " + (if (pm.isDeviceLightIdleMode) "started" else "ended") else return
+            })
+        }
+    }
+
+    private fun startPhoneWatch() {
+        try { getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(netLog) } catch (e: Exception) {}
+        val f = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON); addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_POWER_CONNECTED); addAction(Intent.ACTION_POWER_DISCONNECTED)
+            addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED); addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+            if (Build.VERSION.SDK_INT >= 33) addAction(PowerManager.ACTION_DEVICE_LIGHT_IDLE_MODE_CHANGED)
+        }
+        try { if (Build.VERSION.SDK_INT >= 33) registerReceiver(phoneLog, f, RECEIVER_NOT_EXPORTED) else registerReceiver(phoneLog, f) } catch (e: Exception) {}
+    }
+
+    private fun stopPhoneWatch() {
+        try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(netLog) } catch (e: Exception) {}
+        try { unregisterReceiver(phoneLog) } catch (e: Exception) {}
+    }
+
+    /** Once per app start: can Android put the app to sleep? */
+    private fun logStartup() {
+        if (startLogged) return
+        startLogged = true
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+            val ver = packageManager.getPackageInfo(packageName, 0).versionName
+            var s = "phone app $ver · battery " + if (pm.isIgnoringBatteryOptimizations(packageName)) "unrestricted" else "OPTIMIZED (Android may put the app to sleep)"
+            if (Build.VERSION.SDK_INT >= 28) {
+                if (getSystemService(ActivityManager::class.java).isBackgroundRestricted) s += " · background RESTRICTED"
+                val b = getSystemService(UsageStatsManager::class.java).appStandbyBucket
+                s += " · standby " + when (b) { 5 -> "exempt"; 10 -> "active"; 20 -> "working set"; 30 -> "frequent"; 40 -> "rare"; 45 -> "RESTRICTED"; else -> "$b" }
+            }
+            log(s)
+        } catch (e: Exception) {}
+    }
+
+    // While casting: a minute timer that notices when the app didn't run for a while (it never wakes the phone;
+    // when the phone sleeps it simply runs late). "CPU asleep" = the whole phone slept; otherwise only the app was frozen.
+    private var tickEl = 0L
+    private var tickUp = 0L
+    private val tick = object : Runnable {
+        override fun run() {
+            val el = SystemClock.elapsedRealtime(); val up = SystemClock.uptimeMillis()
+            if (tickEl > 0 && el - tickEl > 90_000) {
+                val gap = el - tickEl; val slept = gap - (up - tickUp)
+                log("app didn't run for ${gap / 1000} s · " + if (slept > 5000) "phone asleep ${slept / 1000} s of it" else "phone awake: the app was frozen")
+            }
+            tickEl = el; tickUp = up
+            if (session != null) main.postDelayed(this, 60_000)
+        }
     }
 
     private fun startRejoin(dev: CastDevice?) {
@@ -415,10 +532,12 @@ class MainActivity : AppCompatActivity() {
         val id = rejoinId ?: return false
         if (rejoining || session != null || !route.isEnabled) return false
         val dev = CastDevice.getFromBundle(route.extras) ?: return false
-        if (dev.deviceId != id) return false
+        // 1.18: a speaker group can come back under a new id (11-17 01:03: Reverend dropped, came back as another id)
+        val byName = dev.deviceId != id && (dev.friendlyName ?: route.name) == rejoinName
+        if (dev.deviceId != id && !byName) return false
         rejoining = true
         scanStop.run(); main.removeCallbacks(scanStop)
-        log("$rejoinName is back: rejoining")
+        log("$rejoinName is back" + (if (byName) " (under a new id)" else "") + ": rejoining")
         try { MediaRouter.getInstance(this).selectRoute(route) } catch (e: Exception) { rejoining = false; return false }
         return true
     }
@@ -454,6 +573,15 @@ class MainActivity : AppCompatActivity() {
                 main.postDelayed({ rejoinScan() }, 15000)
                 return
             }
+            // 1.18: Android sometimes ends a cast that was already playing with "start failed" instead of "ended"
+            // (11-16 23:57 code 2271, 11-17 01:03 code 2251, phone asleep, speaker played on). That's a drop: rejoin.
+            if (session != null && !ownStop()) {
+                val dev = s.castDevice ?: lastDev
+                detach(keepAlive = true)
+                sendSession("SESSION_ENDED", null, "start failed, code $error")
+                startRejoin(dev)
+                return
+            }
             detach()
             sendSession("SESSION_START_FAILED", null, "session_error ($error)")
             sendResult(pickId, false, "session_error ($error)"); pickId = 0
@@ -464,7 +592,7 @@ class MainActivity : AppCompatActivity() {
             val drop = error != 0 && !ownStop()
             detach(keepAlive = drop)
             sendSession("SESSION_ENDED", null, "code $error")
-            if (drop) startRejoin(s.castDevice)
+            if (drop) startRejoin(s.castDevice ?: lastDev)
         }
         override fun onSessionResuming(s: CastSession, sessionId: String) {}
         override fun onSessionResumed(s: CastSession, wasSuspended: Boolean) {
@@ -478,7 +606,7 @@ class MainActivity : AppCompatActivity() {
             val drop = !ownStop()
             detach(keepAlive = drop)
             sendSession("SESSION_ENDED", null, "resume failed, code $error")
-            if (drop) startRejoin(s.castDevice)
+            if (drop) startRejoin(s.castDevice ?: lastDev)
         }
         override fun onSessionSuspended(s: CastSession, reason: Int) {
             sendSession("SESSION_SUSPENDED", s, "reason $reason")   // only for the log; the page waits for the end or the resume
@@ -921,6 +1049,7 @@ class MainActivity : AppCompatActivity() {
 
         @JavascriptInterface fun ready() = main.post {
             sendCastState()
+            logStartup()
             // Only rejoin a speaker that's fully connected; one still reconnecting reports in onSessionResumed.
             castContext.sessionManager.currentCastSession?.takeIf { it.isConnected }?.let {
                 attach(it)
