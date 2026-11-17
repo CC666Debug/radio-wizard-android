@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.content.ContentValues
 import android.os.Bundle
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.MediaStore
@@ -32,6 +34,7 @@ import androidx.mediarouter.app.MediaRouteControllerDialog
 import androidx.mediarouter.media.MediaRouter
 import androidx.mediarouter.media.MediaRouterParams
 import com.google.android.gms.cast.Cast
+import com.google.android.gms.cast.CastDevice
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaMetadata
@@ -233,6 +236,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         main.removeCallbacks(giveUpSuspended); main.removeCallbacks(volSettled)
+        stopRejoin(keepAlive = true)
         castContext.sessionManager.removeSessionManagerListener(sessionListener, CastSession::class.java)
         net.shutdownNow()
         CastKeepAliveService.keyHandler = null
@@ -335,30 +339,121 @@ class MainActivity : AppCompatActivity() {
     private val giveUpSuspended = Runnable {
         val s = castContext.sessionManager.currentCastSession
         if (s == null || !s.isConnected) {
+            val dev = s?.castDevice
             castContext.sessionManager.endCurrentSession(false)
-            detach()
+            detach(keepAlive = dev != null && !ownStop())
             sendSession("SESSION_ENDED", null, "gave up after 15s")
+            startRejoin(dev)
         }
     }
 
-    private fun detach() {
+    private fun detach(keepAlive: Boolean = false) {
         session?.remoteMediaClient?.unregisterCallback(mediaCallback)
         session?.removeCastListener(volumeListener)
         session = null
-        CastKeepAliveService.stop(this)
+        if (!keepAlive) CastKeepAliveService.stop(this)
         if (Build.VERSION.SDK_INT >= 26) web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true)
+    }
+
+    // ── Rejoining after a drop ──────────────────────
+    // 2026-11-16 log: the phone falls off Wi-Fi for a moment (no speakers seen, no internet) and the cast ends with
+    // code 2154 / 2055 while the speaker plays on. For REJOIN_FOR after such a drop the app waits for the network to
+    // come back, looks for that same speaker for up to a minute, and joins it again; the page then picks up what it
+    // plays. Nothing runs between those moments (no polling, no wake lock): it reacts to Android's "network back"
+    // report. The player notification stays up meanwhile so Android doesn't freeze the app. Never after your own Stop.
+    private var rejoinId: String? = null     // CastDevice id of the speaker (or group) that dropped
+    private var rejoinName = ""
+    private var rejoining = false            // the next session start is our own rejoin
+    private var controllerAt = 0L            // the speaker controls (which have Stop) were opened
+    private var netWatch: ConnectivityManager.NetworkCallback? = null
+    private val REJOIN_FOR = 10 * 60_000L
+    private val SCAN_FOR = 60_000L
+
+    private fun ownStop() = SystemClock.elapsedRealtime() - controllerAt < 120_000
+
+    private fun log(msg: String) = main.post {
+        web.evaluateJavascript("window.diag && diag(" + JSONObject.quote(msg) + ")", null)
+    }
+
+    private fun startRejoin(dev: CastDevice?) {
+        if (dev == null || ownStop()) return
+        stopRejoin(keepAlive = true)
+        rejoinId = dev.deviceId; rejoinName = dev.friendlyName ?: "the speaker"
+        log("connection to $rejoinName dropped: will rejoin it when the phone is back on the network (10 min)")
+        main.postDelayed(rejoinTimeout, REJOIN_FOR)
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java)
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) { main.post { rejoinScan() } }
+            }
+            cm.registerDefaultNetworkCallback(cb); netWatch = cb
+        } catch (e: Exception) {}
+        rejoinScan()
+    }
+
+    private val rejoinTimeout = Runnable {
+        if (rejoinId != null) log("didn't find $rejoinName again within 10 min; stopped looking")
+        stopRejoin(keepAlive = false)
+    }
+
+    private val routeWatch = object : MediaRouter.Callback() {
+        override fun onRouteAdded(router: MediaRouter, route: MediaRouter.RouteInfo) { tryRoute(route) }
+        override fun onRouteChanged(router: MediaRouter, route: MediaRouter.RouteInfo) { tryRoute(route) }
+    }
+    private val scanStop = Runnable { try { MediaRouter.getInstance(this).removeCallback(routeWatch) } catch (e: Exception) {} }
+
+    private fun rejoinScan() {
+        if (rejoinId == null || rejoining || session != null) return
+        val selector = castContext.mergedSelector ?: return
+        val router = MediaRouter.getInstance(this)
+        if (router.routes.any { tryRoute(it) }) return
+        router.addCallback(selector, routeWatch, MediaRouter.CALLBACK_FLAG_REQUEST_DISCOVERY)
+        main.removeCallbacks(scanStop); main.postDelayed(scanStop, SCAN_FOR)
+    }
+
+    private fun tryRoute(route: MediaRouter.RouteInfo): Boolean {
+        val id = rejoinId ?: return false
+        if (rejoining || session != null || !route.isEnabled) return false
+        val dev = CastDevice.getFromBundle(route.extras) ?: return false
+        if (dev.deviceId != id) return false
+        rejoining = true
+        scanStop.run(); main.removeCallbacks(scanStop)
+        log("$rejoinName is back: rejoining")
+        try { MediaRouter.getInstance(this).selectRoute(route) } catch (e: Exception) { rejoining = false; return false }
+        return true
+    }
+
+    private fun stopRejoin(keepAlive: Boolean) {
+        val was = rejoinId != null
+        rejoinId = null; rejoining = false
+        main.removeCallbacks(rejoinTimeout); main.removeCallbacks(scanStop); scanStop.run()
+        netWatch?.let { try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } catch (e: Exception) {} }
+        netWatch = null
+        if (was && !keepAlive && session == null) CastKeepAliveService.stop(this)
     }
 
     private val sessionListener = object : SessionManagerListener<CastSession> {
         override fun onSessionStarting(s: CastSession) = sendSession("SESSION_STARTING", null)
         override fun onSessionStarted(s: CastSession, sessionId: String) {
             main.removeCallbacks(giveUpSuspended)
+            val wasRejoin = rejoining
+            stopRejoin(keepAlive = true)
             attach(s)
+            if (wasRejoin) {   // the page treats it like reopening the app: it picks up what the speaker is playing
+                log("rejoined " + (s.castDevice?.friendlyName ?: "the speaker") + " after the drop")
+                sendSession("SESSION_RESUMED", s); sendStatus(); return
+            }
             sendSession("SESSION_STARTED", s)
             sendResult(pickId, true); pickId = 0
             sendStatus()
         }
         override fun onSessionStartFailed(s: CastSession, error: Int) {
+            if (rejoining) {   // our own rejoin didn't take: quietly try again while the window lasts
+                rejoining = false
+                log("rejoin failed (code $error), trying again")
+                main.postDelayed({ rejoinScan() }, 15000)
+                return
+            }
             detach()
             sendSession("SESSION_START_FAILED", null, "session_error ($error)")
             sendResult(pickId, false, "session_error ($error)"); pickId = 0
@@ -366,8 +461,10 @@ class MainActivity : AppCompatActivity() {
         override fun onSessionEnding(s: CastSession) = sendSession("SESSION_ENDING", s)
         override fun onSessionEnded(s: CastSession, error: Int) {
             main.removeCallbacks(giveUpSuspended)
-            detach()
+            val drop = error != 0 && !ownStop()
+            detach(keepAlive = drop)
             sendSession("SESSION_ENDED", null, "code $error")
+            if (drop) startRejoin(s.castDevice)
         }
         override fun onSessionResuming(s: CastSession, sessionId: String) {}
         override fun onSessionResumed(s: CastSession, wasSuspended: Boolean) {
@@ -378,8 +475,10 @@ class MainActivity : AppCompatActivity() {
         }
         override fun onSessionResumeFailed(s: CastSession, error: Int) {
             main.removeCallbacks(giveUpSuspended)
-            detach()
+            val drop = !ownStop()
+            detach(keepAlive = drop)
             sendSession("SESSION_ENDED", null, "resume failed, code $error")
+            if (drop) startRejoin(s.castDevice)
         }
         override fun onSessionSuspended(s: CastSession, reason: Int) {
             sendSession("SESSION_SUSPENDED", s, "reason $reason")   // only for the log; the page waits for the end or the resume
@@ -834,7 +933,9 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface fun pickSpeaker(id: Int, args: String) = main.post {
             val selector = castContext.mergedSelector
             if (selector == null) { sendResult(id, false, "no_speakers"); return@post }
+            stopRejoin(keepAlive = session != null)
             if (session != null) {
+                controllerAt = SystemClock.elapsedRealtime()
                 MediaRouteControllerDialog(this@MainActivity).apply {
                     setOnDismissListener { sendResult(id, false, "cancel") }
                 }.show()
