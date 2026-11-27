@@ -189,7 +189,11 @@ class MainActivity : AppCompatActivity() {
         keys.setSpeakerVolume = { v -> main.post { session?.takeIf { it.isConnected }?.let { askVolume(it, v, v > 0) } } }
         CastKeepAliveService.keyHandler = { k -> main.post { web.evaluateJavascript("window.rwMediaKey && window.rwMediaKey('$k')", null) } }
 
-        castContext.addCastStateListener { sendCastState() }
+        castContext.addCastStateListener { st ->
+            sendCastState()
+            // 1.19: after a drop, speakers showing up again (11-27 log: Reverend gone 00:57, back 02:32) = look for ours now
+            if (rejoinId != null && st != CastState.NO_DEVICES_AVAILABLE) rejoinScan()
+        }
         castContext.sessionManager.addSessionManagerListener(sessionListener, CastSession::class.java)
         startPhoneWatch()
 
@@ -383,7 +387,7 @@ class MainActivity : AppCompatActivity() {
     private var rejoining = false            // the next session start is our own rejoin
     private var controllerAt = 0L            // the speaker controls (which have Stop) were opened
     private var netWatch: ConnectivityManager.NetworkCallback? = null
-    private val REJOIN_FOR = 10 * 60_000L
+    private val REJOIN_FOR = 3 * 60 * 60_000L   // 1.19: was 10 min; a group stayed gone 95 min (11-27)
     private val SCAN_FOR = 60_000L
 
     private fun ownStop() = SystemClock.elapsedRealtime() - controllerAt < 120_000
@@ -496,7 +500,7 @@ class MainActivity : AppCompatActivity() {
         if (dev == null || ownStop()) return
         stopRejoin(keepAlive = true)
         rejoinId = dev.deviceId; rejoinName = dev.friendlyName ?: "the speaker"
-        log("connection to $rejoinName dropped: will rejoin it when the phone is back on the network (10 min)")
+        log("connection to $rejoinName dropped: will rejoin it when it shows up again (3 h)")
         main.postDelayed(rejoinTimeout, REJOIN_FOR)
         try {
             val cm = getSystemService(ConnectivityManager::class.java)
@@ -509,7 +513,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private val rejoinTimeout = Runnable {
-        if (rejoinId != null) log("didn't find $rejoinName again within 10 min; stopped looking")
+        if (rejoinId != null) log("didn't find $rejoinName again within 3 h; stopped looking")
         stopRejoin(keepAlive = false)
     }
 

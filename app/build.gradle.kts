@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.cc666debug.radiowizard"
         minSdk = 24
         targetSdk = 35
-        versionCode = 19
-        versionName = "1.18"
+        versionCode = 20
+        versionName = "1.19"
     }
 
     compileOptions {
@@ -22,6 +22,6 @@ android {
 
 dependencies {
     implementation("androidx.appcompat:appcompat:1.8.0")
-    implementation("androidx.mediarouter:mediarouter:1.9.0-beta01")
+    implementation("androidx.mediarouter:mediarouter:1.9.0")
     implementation("com.google.android.gms:play-services-cast-framework:23.0.0")
 }
